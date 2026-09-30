@@ -45,6 +45,20 @@ New Prometheus metrics expose reserve enablement, configured/current record capa
 | `max_buffer_size` | integer | records | Greater than zero |
 | `max_buffer_age_ms` | integer | milliseconds | Greater than zero and representable as a Go duration |
 
+## Staged reductions
+
+Reducing either threshold runs as a serialized control-plane transition. `PATCH` waits for the transition to finish and returns its final result; it does not return `202 Accepted`. While a transition is active, another API mutation receives `409 Conflict`. A separate administrator-only `GET /api/v1/config/runtime/ingest/transition` reports the current step, active threshold, wait reason, and final error or completion state. The regular `GET` response also includes the most recent transition object. In a cluster, this status and operation remain local to the addressed node.
+
+Increases apply immediately. If a request changes both thresholds, Arc applies any increase first, then completes the size reduction before the age reduction. The persistent SQLite row is written only after every requested step reaches the target. If a transition fails, Arc restores the original live thresholds and leaves the saved override unchanged. Data already flushed successfully during earlier steps remains stored; a failed current flush keeps its uncompleted buffer rows available for retry. Existing WAL settings determine the recovery behavior if the process stops during storage I/O; WAL-disabled deployments do not gain a durability guarantee from this API.
+
+An age reduction uses at most ten monotonically decreasing thresholds. The step count is `min(10, ceil(current_age / target_age))`; thus a target at 25% uses four steps, while a target at 10% or below uses ten. The final step always uses the exact requested value. At each step Arc updates the age threshold, directly flushes buffers that have reached that age, and waits for the resulting work to finish before continuing. Age-triggered flushes do not use the elastic reserve because they use a direct path instead of `flushQueue`.
+
+A size reduction requires an enabled reserve with a positive working band. If its configured capacity is `R` records, the transition limit is `W = floor(0.75 * R)` records per threshold step; the remaining 25% is left as secondary elastic headroom. The step count is `ceil((current_size - target_size) / W)`, with each step reducing the threshold by at most `W` and the final threshold set exactly to the target. Before each next step Arc waits until earlier queue work and reserve occupancy are drained. Existing oversized Arrow batches are split at flush-task boundaries into chunks of at most `W` records; row order, validity, tags, deduplication metadata, and schema metadata are preserved. The reserve continues to hold only size-triggered tasks rejected by a full `flushQueue`; the transition does not redirect all flushes into the reserve.
+
+Before a size reduction, Arc estimates the largest bounded flush workspace from the widest currently buffered row and `W`, applies a conservative 4x multiplier for merge/encoding allocations, and checks process/container memory headroom on the control path. It rejects the reduction before changing live thresholds if the estimate overflows, available memory cannot be determined, or the estimated workspace exceeds available headroom. This is a conservative admission estimate, not a hard allocator reservation: concurrent process allocations can still change actual headroom while the transition runs.
+
+The API performs a local-node change only. `arcli` cluster fan-out can therefore report a partial update if one node rejects its transition or cannot complete its flushes; it is not a distributed transaction. Persistent values are saved per node only after that node completes its full transition.
+
 The settings apply to the current Arc process. Each node reads its own override from the metadata SQLite database at startup. The Arc API does not broadcast changes to cluster peers; `arcli ingest buffer set` coordinates the same change across all healthy nodes after preflighting them.
 
 The size and age thresholds are shared process settings, but each threshold is evaluated independently for every logical ingest buffer, keyed by database and measurement. `max_buffer_size` is therefore a per-buffer threshold, not a process-wide cap: multiple active measurements can collectively hold more records than this value. Shards partition the buffer map to reduce lock contention; they do not create separate configurations. Flush workers consume queued flush tasks and do not own separate ingest buffers or threshold values.
@@ -123,7 +137,7 @@ curl -X DELETE -H "Authorization: Bearer $ARC_TOKEN" \
   http://localhost:8000/api/v1/config/runtime/ingest
 ```
 
-Arc removes the override and restores the startup values immediately. Subsequent restarts continue using startup configuration until another `PATCH` creates an override.
+Arc removes the override and restores the startup values through the same staged-reduction rules when a threshold must be lowered. Subsequent restarts continue using startup configuration until another `PATCH` creates an override. A size decrease through `DELETE` can fail if the elastic reserve is disabled or cannot provide a positive working band.
 
 ## Persistence and precedence
 

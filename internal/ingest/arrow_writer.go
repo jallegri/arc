@@ -856,6 +856,10 @@ type ArrowBuffer struct {
 	// Prevents goroutine explosion under sustained load
 	flushQueue   chan flushTask
 	flushWorkers int
+	// Flush-task accounting is updated at queue/reserve admission and worker
+	// completion. It is inspected only by control paths; writes do not wait on it.
+	pendingFlushTasks atomic.Int64
+	flushActivityCh   chan struct{}
 
 	// Optional reserve for size-triggered flush tasks rejected by flushQueue.
 	// The reserve is inspected only at flush-task admission and worker events,
@@ -864,6 +868,7 @@ type ArrowBuffer struct {
 	elasticReserveTasks    []*flushTask
 	elasticReserveRecords  atomic.Int64
 	elasticReserveCapacity atomic.Int64
+	elasticAdmissionLimit  atomic.Int64
 	elasticReserveEnabled  atomic.Bool
 
 	// closing is the shutdown short-circuit checked by tryEnqueueFlush.
@@ -906,6 +911,8 @@ type ArrowBuffer struct {
 	maxBufferAge    atomic.Int64 // duration in nanoseconds; updated by PatchRuntimeConfig
 	maxBufferSize   atomic.Int64 // records; updated by PatchRuntimeConfig
 	runtimeConfigMu sync.Mutex
+	runtimeChangeMu sync.Mutex
+	flushFailureSeq atomic.Int64
 
 	// Metrics (using atomic operations to avoid lock contention)
 	totalRecordsBuffered atomic.Int64
@@ -1062,6 +1069,7 @@ func (b *ArrowBuffer) currentBufferedRecords() int64 {
 
 func (b *ArrowBuffer) markFlushFailure() {
 	b.totalErrors.Add(1)
+	b.flushFailureSeq.Add(1)
 	b.hasFlushFailure.Store(true)
 	metrics.Get().IncBufferFlushFailures()
 }
@@ -1175,6 +1183,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 		configChangedCh:      make(chan struct{}, 1),
 		flushQueue:           make(chan flushTask, queueSize),
 		flushWorkers:         flushWorkers,
+		flushActivityCh:      make(chan struct{}, 1),
 		flushTimeout:         flushTimeout,
 		sortKeysConfig:       sortKeysConfig,
 		defaultSortKeys:      defaultSortKeys,
@@ -1682,6 +1691,7 @@ func (b *ArrowBuffer) tryEnqueueFlush(
 			return flushElasticReserved
 		}
 	}
+	b.pendingFlushTasks.Add(1)
 	select {
 	case b.flushQueue <- task:
 		depth := b.queueDepth.Add(1)
@@ -1694,10 +1704,14 @@ func (b *ArrowBuffer) tryEnqueueFlush(
 			Msg("Buffer size exceeded, queued flush to worker pool")
 		return flushQueued
 	case <-b.ctx.Done():
+		b.pendingFlushTasks.Add(-1)
+		b.notifyFlushActivity()
 		b.recordWALFallback(int64(totalBuffered), "Flush queue send aborted: ArrowBuffer context canceled")
 		b.walOnlyRecords.Add(int64(totalBuffered))
 		return flushCtxCanceled
 	default:
+		b.pendingFlushTasks.Add(-1)
+		b.notifyFlushActivity()
 		metrics.Get().IncBufferFlushQueueFull(int64(totalBuffered))
 		if b.admitElasticTask(task) {
 			metrics.Get().IncBufferElasticReserveAdmissions(int64(totalBuffered))
@@ -2657,44 +2671,9 @@ func (b *ArrowBuffer) computeNextFlushDeadline() time.Time {
 
 // flushAgedBuffers flushes buffers that have exceeded max age
 func (b *ArrowBuffer) flushAgedBuffers() {
-	now := time.Now().UTC()
-	maxAge := time.Duration(b.maxBufferAge.Load())
-
-	threshold := maxAge
-
-	// Iterate over all shards
-	for shardIdx := range b.shards {
-		shard := b.shards[shardIdx]
-
-		shard.mu.Lock()
-
-		// Check each buffer in this shard for age
-		for key, startTime := range shard.bufferStartTimes {
-			age := now.Sub(startTime)
-			if age >= threshold {
-				b.logger.Info().
-					Str("buffer_key", key).
-					Dur("age", age).
-					Dur("threshold", threshold).
-					Int("shard", shardIdx).
-					Msg("Flushing aged buffer")
-
-				// Parse buffer key to get database and measurement
-				parts := splitBufferKey(key)
-				if len(parts) != 2 {
-					b.logger.Error().Str("buffer_key", key).Msg("Invalid buffer key format")
-					continue
-				}
-
-				flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
-				if err := b.flushBufferLocked(flushCtx, shard, key, parts[0], parts[1]); err != nil {
-					b.logger.Error().Err(err).Str("buffer_key", key).Msg("Failed to flush aged buffer")
-				}
-				flushCancel()
-			}
-		}
-
-		shard.mu.Unlock()
+	threshold := time.Duration(b.maxBufferAge.Load())
+	if err := b.flushAgedBuffersAt(b.ctx, threshold); err != nil {
+		b.logger.Error().Err(err).Msg("Age-triggered flush pass completed with errors")
 	}
 }
 
@@ -2742,13 +2721,18 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 			// Start the storage timeout only when execution begins. A task's time
 			// in flushQueue or the elastic reserve is queueing delay, not I/O time.
 			flushCtx, flushCancel := context.WithTimeout(b.ctx, b.flushTimeout)
-			b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount)
+			flushErr := b.flushRecordsAsync(flushCtx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount)
 			flushCancel()
+			if flushErr != nil {
+				b.logger.Error().Err(flushErr).Str("buffer_key", task.bufferKey).Int("records", task.recordCount).Msg("Flush worker task failed")
+			}
+			b.pendingFlushTasks.Add(-1)
+			b.notifyFlushActivity()
 		}
 	}
 }
 
-func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int) {
+func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int) error {
 	startTime := time.Now()
 
 	// Merge typed column batches
@@ -2767,9 +2751,9 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 			Msg("Failed to merge batches during async flush")
 
 		b.markFlushFailure()
-		// Data is already in WAL (written at ingest time) - no need to restore to buffer
-		// WAL will be replayed on restart or via periodic recovery
-		return
+		// The in-memory batch is no longer retained. Recovery depends on whether
+		// the configured WAL successfully appended the input before buffering.
+		return fmt.Errorf("merge buffered records for %s: %w", bufferKey, err)
 	}
 
 	// Flush with data timestamp partitioning
@@ -2778,11 +2762,13 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 			Err(err).
 			Str("buffer_key", bufferKey).
 			Int("records", recordCount).
-			Msg("Failed to flush - data preserved in WAL for recovery")
+			Msg("Flush failed; recovery depends on WAL configuration and successful WAL append")
 		b.markFlushFailure()
-		// Data is already in WAL (written at ingest time) - no memory growth
-		// WAL will be replayed on restart or via periodic recovery
+		// The in-memory batch is no longer retained. Recovery depends on whether
+		// the configured WAL successfully appended the input before buffering.
+		return err
 	}
+	return nil
 }
 
 // flushWithDataTimePartitioning partitions data by data timestamps (async path)
@@ -3036,10 +3022,9 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 			Err(err).
 			Str("buffer_key", bufferKey).
 			Int("records", recordCount).
-			Msg("Flush failed - data preserved in WAL for recovery")
-		// Data is already in WAL (written at ingest time) - no need to restore to buffer
-		// This prevents memory growth during prolonged S3 outages
-		// WAL will be replayed on restart or via periodic recovery
+			Msg("Flush failed; recovery depends on WAL configuration and successful WAL append")
+		// The in-memory batch is no longer retained. Recovery depends on whether
+		// the configured WAL successfully appended the input before buffering.
 		return err
 	}
 
@@ -3929,6 +3914,8 @@ func (b *ArrowBuffer) FlushAll(ctx context.Context) error {
 //     in-memory buffers synchronously.
 func (b *ArrowBuffer) Close() error {
 	b.logger.Info().Msg("Closing ArrowBuffer...")
+	b.runtimeChangeMu.Lock()
+	defer b.runtimeChangeMu.Unlock()
 
 	// Mark closing BEFORE cancelling so any writer past the shard
 	// unlock observes either the flag (skips send) or the cancelled
@@ -3962,6 +3949,7 @@ drain:
 				break drain
 			}
 			b.queueDepth.Add(-1)
+			b.pendingFlushTasks.Add(-1)
 			abandoned += task.recordCount
 			b.walOnlyRecords.Add(int64(task.recordCount))
 		default:
@@ -3969,7 +3957,9 @@ drain:
 		}
 	}
 	metrics.Get().SetBufferQueueDepth(b.queueDepth.Load())
+	b.notifyFlushActivity()
 	for _, task := range b.takeElasticReserveTasks() {
+		b.pendingFlushTasks.Add(-1)
 		abandoned += task.recordCount
 		b.walOnlyRecords.Add(int64(task.recordCount))
 	}

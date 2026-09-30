@@ -58,6 +58,10 @@ func (b *ArrowBuffer) ConfigureElasticReserveWithPersistence(cfg RuntimeElasticR
 	if b == nil {
 		return fmt.Errorf("arrow buffer is unavailable")
 	}
+	if !b.runtimeChangeMu.TryLock() {
+		return ErrRuntimeIngestTransitionBusy
+	}
+	defer b.runtimeChangeMu.Unlock()
 	if err := validateRuntimeElasticReserveConfig(cfg); err != nil {
 		return err
 	}
@@ -103,6 +107,7 @@ func (b *ArrowBuffer) ConfigureElasticReserveWithPersistence(cfg RuntimeElasticR
 		b.elasticReserveTasks = nil
 	}
 	b.elasticReserveCapacity.Store(cfg.CapacityRecords)
+	b.elasticAdmissionLimit.Store(cfg.CapacityRecords)
 	b.elasticReserveEnabled.Store(cfg.Enabled)
 	metrics.Get().SetBufferElasticReserveEnabled(cfg.Enabled)
 	metrics.Get().SetBufferElasticReserveCapacity(cfg.CapacityRecords)
@@ -120,7 +125,7 @@ func (b *ArrowBuffer) admitElasticTask(task flushTask) bool {
 		return false
 	}
 	used := b.elasticReserveRecords.Load()
-	capacity := b.elasticReserveCapacity.Load()
+	capacity := b.elasticAdmissionLimit.Load()
 	if int64(task.recordCount) > capacity-used {
 		return false
 	}
@@ -131,6 +136,7 @@ func (b *ArrowBuffer) admitElasticTask(task flushTask) bool {
 	b.elasticReserveTasks = append(b.elasticReserveTasks, &queuedTask)
 	used += int64(task.recordCount)
 	b.elasticReserveRecords.Store(used)
+	b.pendingFlushTasks.Add(1)
 	metrics.Get().SetBufferElasticReserveRecords(used)
 	return true
 }

@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -17,8 +19,11 @@ import (
 )
 
 type runtimeConfigBufferStub struct {
-	size int
-	age  int
+	size              int
+	age               int
+	transitionErr     error
+	transitionStarted chan struct{}
+	transitionRelease chan struct{}
 }
 
 func (b *runtimeConfigBufferStub) RuntimeConfig() (int, int) { return b.size, b.age }
@@ -37,6 +42,17 @@ func (b *runtimeConfigBufferStub) PatchRuntimeConfig(size, age *int) error {
 		b.age = *age
 	}
 	return nil
+}
+
+func (b *runtimeConfigBufferStub) ApplyRuntimeConfigTransition(_ context.Context, size, age int, _ func(string, int, int, int)) error {
+	if b.transitionErr != nil {
+		return b.transitionErr
+	}
+	if b.transitionStarted != nil {
+		close(b.transitionStarted)
+		<-b.transitionRelease
+	}
+	return b.PatchRuntimeConfig(&size, &age)
 }
 
 func TestRuntimeIngestConfigPatchPersistsAndDeleteRestoresStartupValues(t *testing.T) {
@@ -165,6 +181,109 @@ func TestRuntimeIngestConfigPatchRollsBackLiveValueWhenPersistenceFails(t *testi
 	}
 }
 
+func TestRuntimeIngestConfigDoesNotPersistFailedTransition(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	store, err := ingest.NewRuntimeIngestConfigStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buffer := &runtimeConfigBufferStub{size: 100, age: 200, transitionErr: errors.New("flush failed")}
+	app := fiber.New()
+	NewRuntimeIngestConfigHandler(buffer, store, ingest.RuntimeIngestConfig{MaxBufferSize: 100, MaxBufferAgeMS: 200}, nil, zerolog.Nop()).RegisterRoutes(app)
+
+	request := httptest.NewRequest("PATCH", "/api/v1/config/runtime/ingest", strings.NewReader(`{"max_buffer_size":50}`))
+	request.Header.Set("Content-Type", "application/json")
+	response, err := app.Test(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != fiber.StatusBadRequest {
+		t.Fatalf("PATCH status = %d, want %d", response.StatusCode, fiber.StatusBadRequest)
+	}
+	if _, found, err := store.Load(); err != nil || found {
+		t.Fatalf("failed transition persisted an override: found=%v err=%v", found, err)
+	}
+	if size, age := buffer.RuntimeConfig(); size != 100 || age != 200 {
+		t.Fatalf("failed transition changed live settings to (%d, %d)", size, age)
+	}
+}
+
+func TestRuntimeIngestConfigRejectsConcurrentMutationAndExposesProgress(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	store, err := ingest.NewRuntimeIngestConfigStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buffer := &runtimeConfigBufferStub{
+		size:              100,
+		age:               200,
+		transitionStarted: make(chan struct{}),
+		transitionRelease: make(chan struct{}),
+	}
+	app := fiber.New()
+	NewRuntimeIngestConfigHandler(buffer, store, ingest.RuntimeIngestConfig{MaxBufferSize: 100, MaxBufferAgeMS: 200}, nil, zerolog.Nop()).RegisterRoutes(app)
+
+	firstResult := make(chan struct {
+		response *http.Response
+		err      error
+	}, 1)
+	go func() {
+		request := httptest.NewRequest("PATCH", "/api/v1/config/runtime/ingest", strings.NewReader(`{"max_buffer_size":150}`))
+		request.Header.Set("Content-Type", "application/json")
+		response, err := app.Test(request)
+		firstResult <- struct {
+			response *http.Response
+			err      error
+		}{response: response, err: err}
+	}()
+	<-buffer.transitionStarted
+
+	second := httptest.NewRequest("PATCH", "/api/v1/config/runtime/ingest", strings.NewReader(`{"max_buffer_size":175}`))
+	second.Header.Set("Content-Type", "application/json")
+	secondResponse, err := app.Test(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResponse.Body.Close()
+	if secondResponse.StatusCode != fiber.StatusConflict {
+		t.Fatalf("overlapping PATCH status = %d, want %d", secondResponse.StatusCode, fiber.StatusConflict)
+	}
+
+	statusResponse, err := app.Test(httptest.NewRequest(http.MethodGet, "/api/v1/config/runtime/ingest/transition", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status runtimeIngestTransitionResponse
+	if err := json.NewDecoder(statusResponse.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	statusResponse.Body.Close()
+	if status.State != "preflight" {
+		t.Fatalf("transition state = %q, want preflight while the operation is blocked", status.State)
+	}
+
+	close(buffer.transitionRelease)
+	result := <-firstResult
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	result.response.Body.Close()
+	if result.response.StatusCode != fiber.StatusOK {
+		t.Fatalf("first PATCH status = %d, want %d", result.response.StatusCode, fiber.StatusOK)
+	}
+}
+
 func TestRuntimeIngestConfigRoutesRequireAdmin(t *testing.T) {
 	am, adminToken, writerToken := mustCreateTestAuth(t)
 	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "runtime.db"))
@@ -185,12 +304,18 @@ func TestRuntimeIngestConfigRoutesRequireAdmin(t *testing.T) {
 	requests := []struct {
 		method string
 		body   string
+		path   string
 	}{
 		{method: http.MethodGet},
 		{method: http.MethodPatch, body: `{"max_buffer_size":300}`},
 		{method: http.MethodDelete},
+		{method: http.MethodGet, path: "/api/v1/config/runtime/ingest/transition"},
 	}
 	for _, tc := range requests {
+		path := tc.path
+		if path == "" {
+			path = "/api/v1/config/runtime/ingest"
+		}
 		for _, authCase := range []struct {
 			name, token string
 			want        int
@@ -199,7 +324,7 @@ func TestRuntimeIngestConfigRoutesRequireAdmin(t *testing.T) {
 			{name: "non-admin", token: writerToken, want: fiber.StatusForbidden},
 			{name: "admin", token: adminToken, want: fiber.StatusOK},
 		} {
-			req := httptest.NewRequest(tc.method, "/api/v1/config/runtime/ingest", strings.NewReader(tc.body))
+			req := httptest.NewRequest(tc.method, path, strings.NewReader(tc.body))
 			if tc.body != "" {
 				req.Header.Set("Content-Type", "application/json")
 			}

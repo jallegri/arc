@@ -10,6 +10,12 @@ The size threshold was already checked once per buffered Arrow batch before this
 
 The API and CLI guides describe persistence precedence, restart behavior, cluster fan-out and best-effort rollback, and the delay between a runtime change and telemetry/Grafana visibility.
 
+## New: staged runtime reductions for ingest buffer thresholds
+
+Reducing `max_buffer_age_ms` now advances through at most ten proportional steps. Reducing `max_buffer_size` requires the optional elastic reserve and limits each threshold step to 75% of its configured record capacity, leaving 25% as secondary burst headroom. Arc splits oversized buffered batches at flush-task boundaries, waits for each step's flush work and reserve occupancy to drain, and persists the requested thresholds only after the full transition completes. The admin API exposes transition progress and rejects overlapping changes. See `docs/runtime-ingest-buffer-config.md` for the step formulas, memory preflight, failure behavior, persistence timing, and node-local cluster scope.
+
+Contributed by [@jalle](https://github.com/jallegri) in [#TBD](https://github.com/Basekick-Labs/arc/pull/TBD).
+
 ## New (experimental): optional in-memory reserve for a full ingest flush queue
 
 Arc can optionally retain size-triggered flush tasks in a bounded, in-memory reserve when the normal flush queue is full. The reserve is disabled by default, can be reconfigured through the admin runtime API, and can be persisted independently in Arc's metadata SQLite database. Capacity and current occupancy are measured in records. Worker dequeue events return reserved tasks to the normal queue; the reserve does not poll from the ingest path or increase sustained flush throughput.
