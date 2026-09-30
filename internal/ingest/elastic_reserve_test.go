@@ -58,6 +58,48 @@ func TestElasticReserveDrainsWhenWorkerFreesQueueSlot(t *testing.T) {
 	}
 }
 
+func TestElasticReserveDoesNotLetNewTaskOvertakePendingTask(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	buf := &ArrowBuffer{
+		ctx:        ctx,
+		flushQueue: make(chan flushTask, 1),
+		logger:     zerolog.Nop(),
+	}
+	if err := buf.ConfigureElasticReserve(RuntimeElasticReserveConfig{Enabled: true, CapacityRecords: 10}); err != nil {
+		t.Fatal(err)
+	}
+	first := flushTask{bufferKey: "db/first", recordCount: 1}
+	older := flushTask{bufferKey: "db/older-reserved", recordCount: 8}
+	newer := flushTask{bufferKey: "db/newer", recordCount: 3}
+	buf.flushQueue <- first
+	buf.queueDepth.Store(1)
+
+	if got := buf.tryEnqueueFlush(older, older.bufferKey, older.recordCount); got != flushElasticReserved {
+		t.Fatalf("older task outcome = %v, want flushElasticReserved", got)
+	}
+	if got := <-buf.flushQueue; got.bufferKey != first.bufferKey {
+		t.Fatalf("worker received %q, want %q", got.bufferKey, first.bufferKey)
+	}
+	metrics.Get().SetBufferQueueDepth(buf.queueDepth.Add(-1))
+
+	// A worker has freed the slot but has not run its reserve-drain event yet.
+	// The newer task is larger than the remaining reserve capacity, so it must
+	// not bypass the older task into the newly free channel slot.
+	if got := buf.tryEnqueueFlush(newer, newer.bufferKey, newer.recordCount); got == flushQueued {
+		t.Fatal("newer task entered flushQueue while an older task remained reserved")
+	}
+	buf.drainElasticReserve()
+	select {
+	case got := <-buf.flushQueue:
+		if got.bufferKey != older.bufferKey {
+			t.Fatalf("next queued task = %q, want older reserved task %q", got.bufferKey, older.bufferKey)
+		}
+	default:
+		t.Fatal("older reserved task was not drained after the queue slot became available")
+	}
+}
+
 func TestElasticReserveExhaustionReportsUnprotectedFallbackWithoutWAL(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

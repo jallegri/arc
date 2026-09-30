@@ -116,11 +116,19 @@ func (b *ArrowBuffer) ConfigureElasticReserveWithPersistence(cfg RuntimeElasticR
 }
 
 func (b *ArrowBuffer) admitElasticTask(task flushTask) bool {
+	b.elasticReserveMu.Lock()
+	defer b.elasticReserveMu.Unlock()
+	return b.admitElasticTaskLocked(task)
+}
+
+// admitElasticTaskLocked appends a task while the caller holds
+// elasticReserveMu. Queue sends and reserve admissions share this lock when
+// the reserve is enabled so a newer task cannot overtake an older reserved
+// task during the worker's receive-to-drain window.
+func (b *ArrowBuffer) admitElasticTaskLocked(task flushTask) bool {
 	if task.recordCount <= 0 {
 		return false
 	}
-	b.elasticReserveMu.Lock()
-	defer b.elasticReserveMu.Unlock()
 	if b.closing.Load() || !b.elasticReserveEnabled.Load() {
 		return false
 	}
@@ -160,8 +168,14 @@ func elasticReserveSlotsBytes(capacityRecords int64) (uint64, error) {
 func (b *ArrowBuffer) drainElasticReserve() {
 	b.elasticReserveMu.Lock()
 	defer b.elasticReserveMu.Unlock()
+	b.enqueueElasticReserveHeadLocked()
+}
+
+// enqueueElasticReserveHeadLocked transfers the FIFO head to the queue if a
+// slot is available. The caller must hold elasticReserveMu.
+func (b *ArrowBuffer) enqueueElasticReserveHeadLocked() bool {
 	if len(b.elasticReserveTasks) == 0 {
-		return
+		return false
 	}
 	task := b.elasticReserveTasks[0]
 	select {
@@ -174,7 +188,9 @@ func (b *ArrowBuffer) drainElasticReserve() {
 		metrics.Get().SetBufferElasticReserveRecords(used)
 		metrics.Get().SetBufferQueueDepth(b.queueDepth.Add(1))
 		metrics.Get().IncBufferFlushQueueEnqueued(int64(task.recordCount))
+		return true
 	default:
+		return false
 	}
 }
 

@@ -1685,11 +1685,8 @@ func (b *ArrowBuffer) tryEnqueueFlush(
 		b.walOnlyRecords.Add(int64(totalBuffered))
 		return flushSkipClosing
 	}
-	if b.elasticReserveEnabled.Load() && b.elasticReserveRecords.Load() > 0 {
-		if b.admitElasticTask(task) {
-			metrics.Get().IncBufferElasticReserveAdmissions(int64(totalBuffered))
-			return flushElasticReserved
-		}
+	if b.elasticReserveEnabled.Load() {
+		return b.tryEnqueueFlushWithReserve(task, bufferKey, totalBuffered)
 	}
 	b.pendingFlushTasks.Add(1)
 	select {
@@ -1712,25 +1709,91 @@ func (b *ArrowBuffer) tryEnqueueFlush(
 	default:
 		b.pendingFlushTasks.Add(-1)
 		b.notifyFlushActivity()
+		// The reserve may have been enabled while this task was attempting the
+		// queue send. Retry through its serialized path so this batch cannot
+		// overtake work already held there.
+		if b.elasticReserveEnabled.Load() {
+			return b.tryEnqueueFlushWithReserve(task, bufferKey, totalBuffered)
+		}
 		metrics.Get().IncBufferFlushQueueFull(int64(totalBuffered))
-		if b.admitElasticTask(task) {
+		return b.fallbackFullFlushQueue(bufferKey, totalBuffered)
+	}
+}
+
+// tryEnqueueFlushWithReserve serializes queue sends with reserve admission
+// and draining. Without this control-path lock, a producer could use a newly
+// freed queue slot between a worker's receive and reserve-drain event, putting
+// a newer batch ahead of older work already owned by the reserve.
+func (b *ArrowBuffer) tryEnqueueFlushWithReserve(task flushTask, bufferKey string, totalBuffered int) flushSendOutcome {
+	b.elasticReserveMu.Lock()
+	defer b.elasticReserveMu.Unlock()
+	if b.closing.Load() {
+		b.recordWALFallback(int64(totalBuffered), "Flush queue send skipped: buffer is closing")
+		b.walOnlyRecords.Add(int64(totalBuffered))
+		return flushSkipClosing
+	}
+
+	// If older tasks are reserved, either append behind them or move FIFO heads
+	// into available queue slots until this task fits. Never send the new task
+	// directly while older reserve tasks remain.
+	for len(b.elasticReserveTasks) > 0 {
+		if b.admitElasticTaskLocked(task) {
+			metrics.Get().IncBufferElasticReserveAdmissions(int64(totalBuffered))
+			return flushElasticReserved
+		}
+		if !b.enqueueElasticReserveHeadLocked() {
+			break
+		}
+	}
+	if len(b.elasticReserveTasks) > 0 {
+		metrics.Get().IncBufferFlushQueueFull(int64(totalBuffered))
+		return b.fallbackFullFlushQueue(bufferKey, totalBuffered)
+	}
+
+	b.pendingFlushTasks.Add(1)
+	select {
+	case b.flushQueue <- task:
+		depth := b.queueDepth.Add(1)
+		metrics.Get().SetBufferQueueDepth(depth)
+		metrics.Get().IncBufferFlushQueueEnqueued(int64(totalBuffered))
+		b.logger.Info().
+			Str("buffer_key", bufferKey).
+			Int("total_records", totalBuffered).
+			Int64("queue_depth", b.queueDepth.Load()).
+			Msg("Buffer size exceeded, queued flush to worker pool")
+		return flushQueued
+	case <-b.ctx.Done():
+		b.pendingFlushTasks.Add(-1)
+		b.notifyFlushActivity()
+		b.recordWALFallback(int64(totalBuffered), "Flush queue send aborted: ArrowBuffer context canceled")
+		b.walOnlyRecords.Add(int64(totalBuffered))
+		return flushCtxCanceled
+	default:
+		b.pendingFlushTasks.Add(-1)
+		b.notifyFlushActivity()
+		metrics.Get().IncBufferFlushQueueFull(int64(totalBuffered))
+		if b.admitElasticTaskLocked(task) {
 			metrics.Get().IncBufferElasticReserveAdmissions(int64(totalBuffered))
 			b.logger.Warn().Str("buffer_key", bufferKey).Int("records", totalBuffered).
 				Int64("reserve_records", b.elasticReserveRecords.Load()).
 				Msg("Flush queue full; retained batch in elastic reserve")
 			return flushElasticReserved
 		}
-		b.recordWALFallback(int64(totalBuffered), "Flush queue and elastic reserve full")
-		b.logger.Warn().
-			Str("buffer_key", bufferKey).
-			Int("records", totalBuffered).
-			Int64("queue_depth", b.queueDepth.Load()).
-			Bool("wal_enabled", b.wal != nil).
-			Msg("Flush queue and elastic reserve are full")
-		b.totalErrors.Add(1)
-		b.walOnlyRecords.Add(int64(totalBuffered))
-		return flushQueueFull
+		return b.fallbackFullFlushQueue(bufferKey, totalBuffered)
 	}
+}
+
+func (b *ArrowBuffer) fallbackFullFlushQueue(bufferKey string, totalBuffered int) flushSendOutcome {
+	b.recordWALFallback(int64(totalBuffered), "Flush queue and elastic reserve full")
+	b.logger.Warn().
+		Str("buffer_key", bufferKey).
+		Int("records", totalBuffered).
+		Int64("queue_depth", b.queueDepth.Load()).
+		Bool("wal_enabled", b.wal != nil).
+		Msg("Flush queue and elastic reserve are full")
+	b.totalErrors.Add(1)
+	b.walOnlyRecords.Add(int64(totalBuffered))
+	return flushQueueFull
 }
 
 func (b *ArrowBuffer) recordWALFallback(records int64, reason string) {
